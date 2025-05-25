@@ -5,7 +5,7 @@ from delete_panel import render_delete_panel
 from profile_panel import render_profile_panel
 from gui_tree import render_tree_panel
 
-API_URL = "http://localhost:8080"
+API_URL = "https://gitbridge-test-1.onrender.com"
 
 def log_message(msg):
     if "log" not in st.session_state:
