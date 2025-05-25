@@ -15,6 +15,6 @@ EOF
 fuser -k 8080/tcp > /dev/null 2>&1
 fuser -k 8501/tcp > /dev/null 2>&1
 
-python3 core/gitbridge.py &
+python3 core/main.py &
 sleep 3
 streamlit run gui.py --server.port=8501 --server.enableXsrfProtection=false --server.enableCORS=false
