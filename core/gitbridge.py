@@ -98,7 +98,7 @@ def git_lock(timeout: int = 30):
         lock.acquire(timeout=timeout)
         logger.info("Acquired Git lock")
         yield
-n    except Timeout:
+    except Timeout:
         raise Exception("Could not acquire Git lock within timeout period")
     finally:
         if lock.is_locked:
@@ -141,10 +141,10 @@ def commit_push_safe(msg: str) -> bool:
                 safe_git_operation(["git", "add", "."])
                 safe_git_operation(["git", "commit", "-m", msg])
                 try:
-                    safe_git_operation(["git", "pull", "origin", "main", "--rebase"] )
+                    safe_git_operation(["git", "pull", "origin", "main", "--rebase"])
                 except subprocess.CalledProcessError:
                     logger.warning("Pull failed, continuing with push")
-                safe_git_operation(["git", "push", "origin", "HEAD:main"] )
+                safe_git_operation(["git", "push", "origin", "HEAD:main"])
                 logger.info(f"Committed and pushed: {msg}")
                 return True
         except Exception as e:
@@ -159,27 +159,28 @@ def commit_push_safe(msg: str) -> bool:
 # ---------------------------------------------------------------------
 def ensure_repository():
     """Ensure repository exists, clone if missing, and update main branch"""
-    if not LOCAL_FOLDER.exists():
-        logger.info("Cloning repository...")
-        # generate a simple askpass helper script
-        helper = LOCAL_FOLDER.parent / ".git_askpass.sh"
-        helper.write_text(f"#!/bin/sh\necho {TOKEN}")
-        helper.chmod(0o700)
-        env = os.environ.copy()
-        env.update({"GIT_ASKPASS": str(helper), "GITHUB_TOKEN": TOKEN})
-        subprocess.run(
-            ["git", "clone", f"https://github.com/{REPO}.git", str(LOCAL_FOLDER)],
-            check=True,
-            timeout=60,
-            env=env
-        )
-        logger.info("Repository cloned successfully")
     try:
+        if not LOCAL_FOLDER.exists():
+            logger.info("Cloning repository...")
+            helper = LOCAL_FOLDER.parent / ".git_askpass.sh"
+            helper.write_text(f"#!/bin/sh\necho {TOKEN}")
+            helper.chmod(0o700)
+            env = os.environ.copy()
+            env.update({"GIT_ASKPASS": str(helper), "GITHUB_TOKEN": TOKEN})
+            subprocess.run(
+                ["git", "clone", f"https://github.com/{REPO}.git", str(LOCAL_FOLDER)],
+                check=True,
+                timeout=60,
+                env=env
+            )
+            logger.info("Repository cloned successfully")
         safe_git_operation(["git", "checkout", "-B", "main"])
         safe_git_operation(["git", "pull", "origin", "main"])
         logger.info("Repository is ready on main branch")
-    except Exception:
-        logger.warning("Could not checkout/pull main; continuing")
+    except OSError as e:
+        logger.warning(f"OS error in ensure_repository (skipping clone/setup): {e}")
+    except subprocess.CalledProcessError as e:
+        logger.warning(f"Git operation failed during ensure_repository: {e}")
 
 # Initialize repository
 ensure_repository()
@@ -204,7 +205,7 @@ def handle_errors(f):
     return wrapper
 
 # ---------------------------------------------------------------------
-# 6. FLASK APP
+# 6. FLASK APP & ROUTES
 # ---------------------------------------------------------------------
 app = Flask(__name__)
 logger.info("GitBridge backend starting...")
@@ -212,5 +213,153 @@ logger.info(f"Repository: {REPO}")
 logger.info(f"Local folder: {LOCAL_FOLDER.resolve()}")
 logger.info(f"Safe mode: {SAFE_MODE}")
 
-# Helper: atomic write
 
+def write_file_safe(path: Path, content: str) -> None:
+    """Safely write file with atomic rename"""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + '.tmp')
+        tmp.write_text(content, encoding='utf-8')
+        tmp.rename(path)
+        logger.info(f"File written successfully: {path}")
+    except Exception as e:
+        logger.error(f"Failed to write file {path}: {e}")
+        raise
+
+@app.get("/")
+@handle_errors
+def index():
+    return jsonify(
+        status="GitBridge is live",
+        version="2.0-stable",
+        endpoints=["/upload","/move","/delete","/tree","/profiles","/health","/verify_upload"],
+        active_profile=profile.get("name","unknown")
+    )
+
+@app.post("/upload")
+@handle_errors
+def upload():
+    data = request.get_json(force=True)
+    if not data or "path" not in data or "content" not in data:
+        return jsonify(error="Missing required: path, content"), 400
+    file_path = validate_path(data["path"])
+    write_file_safe(file_path, data["content"])
+    commit_push_safe(f"Upload {data['path']}")
+    return jsonify(status="success", path=data["path"])  
+
+@app.post("/move")
+@handle_errors
+def move():
+    data = request.get_json(force=True)
+    if not data or "src" not in data or "dst" not in data:
+        return jsonify(error="Missing required: src, dst"), 400
+    src = validate_path(data["src"])
+    dst = validate_path(data["dst"])
+    if not src.exists():
+        return jsonify(error="Source not found"), 404
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(src), str(dst))
+    commit_push_safe(f"Move {data['src']} to {data['dst']}")
+    return jsonify(status="success", from_=data["src"], to=data["dst"])  
+
+@app.post("/delete")
+@handle_errors
+def delete():
+    data = request.get_json(force=True)
+    if not data or "path" not in data:
+        return jsonify(error="Missing required: path"), 400
+    if SAFE_MODE:
+        return jsonify(error="Deletion disabled (safe mode)"), 403
+    fp = validate_path(data["path"])
+    if not fp.exists():
+        return jsonify(error="File not found"), 404
+    fp.unlink()
+    commit_push_safe(f"Delete {data['path']}")
+    return jsonify(status="success", path=data["path"])  
+
+@app.get("/tree")
+@handle_errors
+def tree():
+    files = []
+    for p in LOCAL_FOLDER.rglob("*"):
+        if p.is_file() and not p.name.startswith('.'):
+            files.append(str(p.relative_to(LOCAL_FOLDER)))
+    files.sort()
+    return jsonify(files=files, count=len(files))
+
+@app.get("/profiles")
+@handle_errors
+def profiles():
+    profiles = []
+    for f in PROFILE_PATH.parent.glob("*.json"):
+        try:
+            j = json.loads(f.read_text())
+            if 'name' in j:
+                profiles.append(j['name'])
+        except:
+            continue
+    profiles.sort()
+    return jsonify(profiles=profiles)
+
+@app.post("/profiles/activate")
+@handle_errors
+def activate_profile():
+    data = request.get_json(force=True)
+    if 'name' not in data:
+        return jsonify(error="Missing required: name"), 400
+    target = None
+    for f in PROFILE_PATH.parent.glob("*.json"):
+        try:
+            j = json.loads(f.read_text())
+            if j.get('name') == data['name']:
+                target = f
+                break
+        except:
+            continue
+    if not target:
+        return jsonify(error="Profile not found"), 404
+    backup = PROFILE_PATH.with_suffix('.bak')
+    shutil.copy2(PROFILE_PATH, backup)
+    shutil.copy2(target, PROFILE_PATH)
+    return jsonify(status="success", name=data['name'], message="Restart required")
+
+@app.get("/health")
+@handle_errors
+def health():
+    info = {"status": "ok", "repo": str(LOCAL_FOLDER), "safe_mode": SAFE_MODE}
+    if not LOCAL_FOLDER.exists():
+        info['status'] = 'error'
+        info['message'] = 'Repo not found'
+        return jsonify(info), 500
+    try:
+        st = safe_git_operation(["git", "status", "--porcelain"]).stdout
+        info['git_status'] = 'clean' if not st.strip() else 'dirty'
+        safe_git_operation(["git", "ls-remote", "origin"], timeout=10)
+        info['remote'] = 'connected'
+    except subprocess.CalledProcessError as e:
+        info['status'] = 'warning'
+        info['remote'] = 'disconnected'
+        info['git_error'] = str(e)
+    except subprocess.TimeoutExpired:
+        info['status'] = 'warning'
+        info['remote'] = 'timeout'
+    code = 200 if info['status'] == 'ok' else 500
+    return jsonify(info), code
+
+@app.post("/verify_upload")
+@handle_errors
+def verify_upload():
+    data = request.get_json(force=True)
+    if 'path' not in data:
+        return jsonify(error="Missing required: path"), 400
+    p = validate_path(data['path'])
+    exists = p.exists()
+    res = {'exists': exists, 'path': str(p.relative_to(LOCAL_FOLDER))}
+    if exists:
+        st = p.stat()
+        res.update(size=st.st_size, modified=st.st_mtime)
+    return jsonify(res)
+
+if __name__ == '__main__':
+    port = int(os.getenv('PORT', 8080))
+    app.run(host='0.0.0.0', port=port, debug=False)
